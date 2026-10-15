@@ -1,0 +1,24 @@
+{
+  "helmet_and_vest_missing.mp4": {
+    "intended": {
+      "helmet": "missing",
+      "high_visibility_vest": "missing"
+    },
+    "reviewed": {
+      "helmet": "missing",
+      "high_visibility_vest": "missing"
+    },
+    "review_notes": "Manually verified: worker walking across warehouse floor wearing navy t-shirt without helmet and without vest throughout clip."
+  },
+  "helmet_missing.mp4": {
+    "intended": {
+      "helmet": "missing",
+      "high_visibility_vest": "present"
+    },
+    "reviewed": {
+      "helmet": "missing",
+      "high_visibility_vest": "present"
+    },
+    "review_notes": "Manually verified: worker walking across warehouse floor wearing high-visibility yellow vest with reflective stripes over dark long sleeves, without helmet throughout clip."
+  }
+}

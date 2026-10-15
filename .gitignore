@@ -1,0 +1,41 @@
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# SQLite & Data
+*.db
+*.sqlite
+*.sqlite3
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+
+# OS & IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Secrets and local config
+.env
+*.pem
+*.key
+
+# Test media / temp frames
+scratch/
+tmp/
+temp/
+
+# Videos and footage
+*.mp4
+*.avi
+*.mov
+*.mkv
+
