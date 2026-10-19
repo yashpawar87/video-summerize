@@ -39,4 +39,5 @@ temp/
 *.avi
 *.mov
 *.mkv
+!ppe_test_dataset/*.mp4
 

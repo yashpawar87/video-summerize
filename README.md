@@ -42,11 +42,11 @@ Provide structured, fact-grounded summaries of short CCTV-style safety clips. Th
 │   ├── test_ollama_client.py
 │   └── test_evaluation.py
 └── ppe_test_dataset/           # Smoke test dataset
-    ├── helmet_and_vest_missing.mp4       # local test media, ignored by Git
-    ├── helmet_missing.mp4                 # local test media, ignored by Git
-    ├── restricted_zone_entry.mp4          # local test media, ignored by Git
-    ├── fall_protection_hazard.mp4        # local test media, ignored by Git
-    ├── forklift_pedestrian_hazard.mp4    # local test media, ignored by Git
+    ├── helmet_and_vest_missing.mp4       # tracked smoke-test media
+    ├── helmet_missing.mp4                 # tracked smoke-test media
+    ├── restricted_zone_entry.mp4          # tracked smoke-test media
+    ├── fall_protection_hazard.mp4        # tracked smoke-test media
+    ├── forklift_pedestrian_hazard.mp4    # tracked smoke-test media
     └── manifest.json
 ```
 
