@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 from ppe_event_summarizer import (
+    IncidentType,
     OllamaClient,
     SampledFrame,
     PPESummary,
@@ -50,6 +51,27 @@ def test_prompt_does_not_contain_expected_labels():
     assert "INDEPENDENTLY" in prompt
 
 
+def test_auto_prompt_classifies_without_filename():
+    prompt = build_ollama_prompt(
+        duration_sec=10.0,
+        sampled_timestamps=[1.0, 5.0, 9.0],
+        incident_type=None,
+    )
+    assert "Do not use the filename" in prompt
+    assert "ppe_compliance | restricted_zone | osha_hazard" in prompt
+    assert "A warning sign or restricted-area label describes the boundary" in prompt
+    assert "choose 'osha_hazard' if any non-PPE workplace hazard is visible" in prompt
+
+
+def test_explicit_incident_type_remains_supported():
+    prompt = build_ollama_prompt(
+        duration_sec=10.0,
+        sampled_timestamps=[1.0],
+        incident_type=IncidentType.OSHA_HAZARD,
+    )
+    assert "Identify visible OSHA-related safety hazards" in prompt
+
+
 @patch("requests.post")
 def test_ollama_client_success(mock_post):
     mock_resp = MagicMock()
@@ -76,7 +98,7 @@ def test_ollama_client_success(mock_post):
 
     assert isinstance(summary, PPESummary)
     assert summary.alert_assessment.value == "supported"
-    assert len(summary.ppe_observations) == 2
+    assert len(summary.safety_observations) == 2
 
     # Check payload sent to mock_post
     call_args = mock_post.call_args[1]

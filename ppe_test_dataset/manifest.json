@@ -1,5 +1,6 @@
 {
   "helmet_and_vest_missing.mp4": {
+    "incident_type": "ppe_compliance",
     "intended": {
       "helmet": "missing",
       "high_visibility_vest": "missing"
@@ -11,6 +12,7 @@
     "review_notes": "Manually verified: worker walking across warehouse floor wearing navy t-shirt without helmet and without vest throughout clip."
   },
   "helmet_missing.mp4": {
+    "incident_type": "ppe_compliance",
     "intended": {
       "helmet": "missing",
       "high_visibility_vest": "present"
@@ -20,5 +22,37 @@
       "high_visibility_vest": "present"
     },
     "review_notes": "Manually verified: worker walking across warehouse floor wearing high-visibility yellow vest with reflective stripes over dark long sleeves, without helmet throughout clip."
+  },
+  "restricted_zone_entry.mp4": {
+    "incident_type": "restricted_zone",
+    "intended": {
+      "zone_boundary_crossing": "detected",
+      "authorization_indicators": "missing"
+    },
+    "reviewed": {
+      "zone_boundary_crossing": "detected",
+      "authorization_indicators": "missing"
+    },
+    "review_notes": "Manually verified: CCTV 08-24 footage. Worker in grey jacket approaches and enters red-outlined restricted zone boundary on the factory floor. Prominent 'RESTRICTED AREA — AUTHORIZED PERSONNEL ONLY' sign visible on the cage. No badge, escort, or additional authorization indicator visible. Forklift parked in background."
+  },
+  "fall_protection_hazard.mp4": {
+    "incident_type": "osha_hazard",
+    "intended": {
+      "fall_protection_hazard": "detected"
+    },
+    "reviewed": {
+      "fall_protection_hazard": "detected"
+    },
+    "review_notes": "Manually verified: Construction site with worker standing on elevated concrete slab (multi-storey platform), holding a spirit level. Open unprotected edge visible on left side. No safety harness, lanyard, guardrail, or fall arrest system visible on the worker or the open edge. Traffic cones and ladder present in scene. Worker wears white hard hat and hi-vis vest."
+  },
+  "forklift_pedestrian_hazard.mp4": {
+    "incident_type": "osha_hazard",
+    "intended": {
+      "forklift_pedestrian_proximity": "detected"
+    },
+    "reviewed": {
+      "forklift_pedestrian_proximity": "detected"
+    },
+    "review_notes": "Manually verified: Warehouse aisle with green-painted pedestrian lane. A pedestrian in hi-vis vest is walking within or immediately adjacent to the pedestrian lane while a forklift truck travels in close proximity in the same aisle. A second pedestrian is visible in the background. Worker lacks adequate separation from the operating forklift. Overhead CCTV angle."
   }
 }

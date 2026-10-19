@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-ppe_event_summarizer.py — Local PPE Video Summarization
+ppe_event_summarizer.py — Local Safety Video Summarization
 
-Summarizes short PPE (personal protective equipment) incident videos using
-a local Vision-Language Model (VLM) via Ollama, following safety and evidence rules.
+Summarizes short safety incident videos using a local Vision-Language Model (VLM)
+via Ollama. Supports three incident categories:
+  - PPE Compliance (helmet, high-visibility vest)
+  - Restricted Zone Entry
+  - OSHA Safety Hazards (fall protection, forklift/pedestrian proximity)
 """
 
 from __future__ import annotations
@@ -32,7 +35,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ppe_event_summarizer")
 
-PROMPT_VERSION = "v1.0"
+PROMPT_VERSION = "v2.0"
 DEFAULT_MODEL = "qwen3-vl:4b"
 DEFAULT_OLLAMA_HOST = "http://localhost:11434"
 DEFAULT_DB_PATH = Path("data/ppe_events.db")
@@ -43,6 +46,27 @@ MAX_FRAME_WIDTH = 1280
 # =====================================================================
 # Data Models and Enums
 # =====================================================================
+
+class IncidentType(str, Enum):
+    PPE_COMPLIANCE = "ppe_compliance"
+    RESTRICTED_ZONE = "restricted_zone"
+    OSHA_HAZARD = "osha_hazard"
+
+
+# Required observation items per incident type
+REQUIRED_OBSERVATIONS: Dict[str, List[str]] = {
+    IncidentType.PPE_COMPLIANCE: ["helmet", "high_visibility_vest"],
+    IncidentType.RESTRICTED_ZONE: ["zone_boundary_crossing", "authorization_indicators"],
+    IncidentType.OSHA_HAZARD: [],  # At least one hazard observation required; validated dynamically
+}
+
+# Known OSHA hazard observation item names the model may return
+KNOWN_OSHA_ITEMS = {
+    "fall_protection_hazard", "fall_hazard", "fall_protection",
+    "forklift_pedestrian_proximity", "forklift_hazard", "forklift_pedestrian_hazard",
+    "unprotected_edge", "elevated_work", "guardrail",
+}
+
 
 class AlertAssessment(str, Enum):
     SUPPORTED = "supported"
@@ -55,9 +79,12 @@ class VisibleStatus(str, Enum):
     MISSING = "missing"
     UNCERTAIN = "uncertain"
     NOT_OBSERVED = "not_observed"
+    DETECTED = "detected"
+    NOT_DETECTED = "not_detected"
 
 
-class PPEObservation(BaseModel):
+class SafetyObservation(BaseModel):
+    """A single safety observation (PPE item, hazard, or zone compliance check)."""
     item: str
     visible_status: VisibleStatus
     evidence: str
@@ -67,35 +94,117 @@ class PPEObservation(BaseModel):
     @classmethod
     def normalize_item(cls, v: str) -> str:
         v_clean = v.strip().lower().replace("-", "_").replace(" ", "_")
+        # PPE normalizations
         if v_clean in ("vest", "high_vis_vest", "hi_vis_vest", "high_visibility_vest"):
             return "high_visibility_vest"
         if v_clean in ("hard_hat", "hardhat", "helmet", "safety_helmet"):
             return "helmet"
+        # Zone normalizations
+        if v_clean in ("zone_crossing", "boundary_crossing", "restricted_area_entry", "zone_entry"):
+            return "zone_boundary_crossing"
+        if v_clean in ("authorization", "auth_indicators", "personnel_authorization"):
+            return "authorization_indicators"
+        # OSHA hazard normalizations
+        if v_clean in ("fall_hazard", "fall_protection", "unprotected_edge", "elevated_work_without_protection"):
+            return "fall_protection_hazard"
+        if v_clean in ("forklift_hazard", "forklift_pedestrian", "forklift_proximity", "vehicle_pedestrian_conflict"):
+            return "forklift_pedestrian_proximity"
         return v_clean
 
     @field_validator("evidence_timestamps_sec")
     @classmethod
     def validate_timestamps(cls, v: List[float]) -> List[float]:
-        # Sort and round timestamps
         return [round(float(t), 2) for t in sorted(v)]
 
 
-class PPESummary(BaseModel):
+# Backward-compatible alias
+PPEObservation = SafetyObservation
+
+
+class SafetySummary(BaseModel):
+    """Unified summary schema for all incident types."""
     summary: str
     visible_activity: str
+    incident_type: str = IncidentType.PPE_COMPLIANCE
     alert_assessment: AlertAssessment
-    ppe_observations: List[PPEObservation]
+    safety_observations: List[SafetyObservation]
     recommended_follow_up: str
     human_review_required: bool
 
-    @model_validator(mode="after")
-    def validate_required_items(self) -> PPESummary:
-        items = {obs.item for obs in self.ppe_observations}
-        if "helmet" not in items:
-            raise ValueError("PPE observations must contain an entry for 'helmet'.")
-        if "high_visibility_vest" not in items:
-            raise ValueError("PPE observations must contain an entry for 'high_visibility_vest'.")
-        return self
+    @field_validator("incident_type")
+    @classmethod
+    def validate_incident_type(cls, v: str) -> str:
+        try:
+            return IncidentType(v).value
+        except ValueError as exc:
+            raise ValueError(
+                "incident_type must be one of: "
+                + ", ".join(item.value for item in IncidentType)
+            ) from exc
+
+    def validate_for_incident_type(self, incident_type: IncidentType) -> None:
+        """Validate that required observation items are present for the given incident type."""
+        items = {obs.item for obs in self.safety_observations}
+        required = REQUIRED_OBSERVATIONS.get(incident_type, [])
+        for req in required:
+            if req not in items:
+                raise ValueError(
+                    f"Safety observations for incident type '{incident_type}' "
+                    f"must contain an entry for '{req}'. Got: {items}"
+                )
+        if incident_type == IncidentType.OSHA_HAZARD and not items:
+            raise ValueError("OSHA hazard summary must include at least one safety observation.")
+
+        # VisibleStatus is a union of all incident vocabularies. Enforce the
+        # incident-specific vocabulary before persisting model output.
+        restricted_statuses = {
+            "zone_boundary_crossing": {
+                VisibleStatus.DETECTED,
+                VisibleStatus.NOT_DETECTED,
+                VisibleStatus.UNCERTAIN,
+                VisibleStatus.NOT_OBSERVED,
+            },
+            "authorization_indicators": {
+                VisibleStatus.PRESENT,
+                VisibleStatus.MISSING,
+                VisibleStatus.UNCERTAIN,
+                VisibleStatus.NOT_OBSERVED,
+            },
+        }
+        hazard_statuses = {
+            VisibleStatus.DETECTED,
+            VisibleStatus.NOT_DETECTED,
+            VisibleStatus.UNCERTAIN,
+            VisibleStatus.NOT_OBSERVED,
+        }
+        ppe_statuses = {
+            VisibleStatus.PRESENT,
+            VisibleStatus.MISSING,
+            VisibleStatus.UNCERTAIN,
+            VisibleStatus.NOT_OBSERVED,
+        }
+
+        for obs in self.safety_observations:
+            if incident_type == IncidentType.RESTRICTED_ZONE:
+                allowed = restricted_statuses.get(obs.item)
+            elif incident_type == IncidentType.OSHA_HAZARD:
+                # PPE may be reported as a secondary observation in an OSHA
+                # scene; hazard observations use the hazard vocabulary.
+                allowed = ppe_statuses if obs.item in {"helmet", "high_visibility_vest"} else hazard_statuses
+            else:
+                allowed = ppe_statuses
+
+            if allowed is not None and obs.visible_status not in allowed:
+                allowed_values = ", ".join(sorted(status.value for status in allowed))
+                raise ValueError(
+                    f"Observation '{obs.item}' for incident type '{incident_type.value}' "
+                    f"must use one of: {allowed_values}. "
+                    f"Got '{obs.visible_status.value}'."
+                )
+
+
+# Backward-compatible alias
+PPESummary = SafetySummary
 
 
 @dataclass
@@ -270,14 +379,18 @@ def extract_frames(
 def validate_summary_json(
     raw_content: Union[str, Dict[str, Any]],
     video_duration: Optional[float] = None,
-) -> PPESummary:
+    incident_type: Optional[IncidentType] = IncidentType.PPE_COMPLIANCE,
+) -> SafetySummary:
     """
-    Validate raw model output or dictionary against the required PPE summary schema.
+    Validate raw model output against the SafetySummary schema.
+    Accepts both the new 'safety_observations' key and the legacy 'ppe_observations' key.
+    Validates required items based on incident_type. If incident_type is None,
+    the model's declared incident_type is used after validating it.
     Raises ValueError if validation fails.
     """
     if isinstance(raw_content, str):
         content = raw_content.strip()
-        # Handle markdown fences if returned by LLM
+        # Strip markdown fences if returned by LLM
         if content.startswith("```"):
             lines = content.splitlines()
             if lines[0].startswith("```"):
@@ -285,25 +398,60 @@ def validate_summary_json(
             if lines and lines[-1].strip() == "```":
                 lines = lines[:-1]
             content = "\n".join(lines).strip()
-
         try:
             data = json.loads(content)
         except json.JSONDecodeError as exc:
             raise ValueError(f"Malformed JSON returned by model: {exc}\nRaw: {raw_content[:200]}") from exc
     elif isinstance(raw_content, dict):
-        data = raw_content
+        data = dict(raw_content)  # shallow copy — never mutate the caller's dict
     else:
         raise ValueError(f"Unsupported content type for validation: {type(raw_content)}")
 
+    # Backward-compat: map legacy 'ppe_observations' key to 'safety_observations'
+    if isinstance(data, dict) and "ppe_observations" in data and "safety_observations" not in data:
+        data["safety_observations"] = data.pop("ppe_observations")
+
+    # For automatic classification, require and validate the model's declared
+    # category before Pydantic's compatibility validator can normalize it.
+    if incident_type is None:
+        raw_incident_type = data.get("incident_type") if isinstance(data, dict) else None
+        try:
+            validation_incident_type = IncidentType(raw_incident_type)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Automatic incident classification must return incident_type as one of: "
+                + ", ".join(item.value for item in IncidentType)
+            ) from exc
+    else:
+        validation_incident_type = incident_type
+        # Inject incident_type if missing from model output for explicit,
+        # backwards-compatible callers.
+        if isinstance(data, dict) and "incident_type" not in data:
+            data["incident_type"] = incident_type.value
+
     try:
-        summary_obj = PPESummary.model_validate(data)
+        summary_obj = SafetySummary.model_validate(data)
     except Exception as exc:
         raise ValueError(f"Summary failed schema validation: {exc}") from exc
 
-    # Validate timestamps within clip duration if provided
+    # Validate required items for this incident type
+    try:
+        summary_obj.validate_for_incident_type(validation_incident_type)
+    except ValueError:
+        raise
+
+    # The requested incident type is authoritative. Do not allow a model to
+    # return a valid-looking summary under a different category.
+    if incident_type is not None and summary_obj.incident_type != incident_type.value:
+        raise ValueError(
+            f"Summary incident_type '{summary_obj.incident_type}' does not match "
+            f"requested incident type '{incident_type.value}'"
+        )
+
+    # Validate evidence timestamps within clip duration
     if video_duration is not None and video_duration > 0:
-        tolerance = 1.0  # slight tolerance for frame rounding
-        for obs in summary_obj.ppe_observations:
+        tolerance = 1.0
+        for obs in summary_obj.safety_observations:
             for ts in obs.evidence_timestamps_sec:
                 if ts < 0.0 or ts > (video_duration + tolerance):
                     raise ValueError(
@@ -524,12 +672,14 @@ class PPEDatabase:
 def build_ollama_prompt(
     duration_sec: float,
     sampled_timestamps: List[float],
+    incident_type: Optional[IncidentType] = IncidentType.PPE_COMPLIANCE,
     alert_type: Optional[str] = None,
     alert_offset_sec: Optional[float] = None,
 ) -> str:
     """
-    Construct VLM prompt adhering strictly to evidence and safety rules.
-    NEVER put ground truth or expected test labels in prompt!
+    Construct VLM prompt for the given incident type.
+    Uses a distinct template for PPE compliance, restricted zone, and OSHA hazards.
+    NEVER puts ground truth or expected labels into the prompt!
     """
     timestamps_str = ", ".join(f"{t:.2f}s" for t in sampled_timestamps)
     metadata_notes = [f"Clip duration: {duration_sec:.2f} seconds."]
@@ -537,34 +687,90 @@ def build_ollama_prompt(
         metadata_notes.append(f"Upstream detector alert type: '{alert_type}'.")
     if alert_offset_sec is not None:
         metadata_notes.append(f"Alert occurred at offset: {alert_offset_sec:.2f} seconds.")
-
     meta_str = " ".join(metadata_notes)
 
-    prompt = f"""You are an objective CCTV safety video analyst inspecting short surveillance footage.
-{meta_str}
-You are provided with {len(sampled_timestamps)} sampled frames captured at clip timestamps: [{timestamps_str}].
+    n_frames = len(sampled_timestamps)
+    common_header = (
+        f"You are an objective CCTV safety video analyst inspecting short surveillance footage.\n"
+        f"{meta_str}\n"
+        f"You are provided with {n_frames} sampled frames captured at clip timestamps: [{timestamps_str}].\n\n"
+        "STRICT RULES (apply to all incident types):\n"
+        "- Report ONLY what is directly visible in the frames. Do not assume or extrapolate.\n"
+        "- 'not_observed': item or feature not visible in any sampled frame.\n"
+        "- 'uncertain': body region or feature is blurred, occluded, small, or poorly lit.\n"
+        "- Include 'evidence' text and 'evidence_timestamps_sec' for every observation.\n"
+        "- Set 'human_review_required' to true when visibility is poor or evidence conflicts between frames.\n"
+        "- Return ONLY a valid JSON object. Do NOT output markdown fences or explanatory text.\n"
+    )
 
-INSTRUCTIONS & STRICT RULES:
-1. Describe ONLY what is directly visible in the sampled frames and metadata. Do not assume or extrapolate.
-2. Evaluate PPE compliance for 'helmet' and 'high_visibility_vest' INDEPENDENTLY. Do NOT treat PPE as a single blob.
-3. Allowed values:
-   - 'alert_assessment': 'supported', 'contradicted', 'inconclusive'
-   - 'visible_status': 'present', 'missing', 'uncertain', 'not_observed'
-4. Uncertainty and Evidence rules:
-   - If a body region (head or torso) is clearly visible and the PPE item is NOT worn (e.g. bare head with no helmet, or shirt without safety vest), report visible_status as 'missing'.
-   - If a body region (head or torso) is small, blurred, occluded, poorly lit, or out of frame, report visible_status as 'uncertain'.
-   - Do NOT mark an item as missing simply because it is unseen in a single frame.
-   - 'not_observed' means the body region or item was not visible or present in any of the sampled frames (e.g. out of camera view).
-   - For every observation, include 'evidence' explaining what is visible, and 'evidence_timestamps_sec' listing the timestamps of the frames supporting your finding.
-   - Set 'human_review_required' to true if visibility is poor, observations conflict across frames, or evidence is ambiguous.
-5. You MUST return ONLY a valid JSON object matching the exact schema below. Do not output markdown fences or explanatory text.
+    if incident_type is None:
+        prompt = common_header + f"""
+TASK: Analyze the clip and classify the primary safety incident visible. Do not use the filename.
+Choose exactly one incident_type based only on the sampled frames:
+- 'ppe_compliance': helmet or high-visibility vest compliance.
+- 'restricted_zone': entry into or crossing of a marked restricted/unauthorized area.
+- 'osha_hazard': another visible workplace hazard such as fall exposure or forklift/pedestrian proximity.
+
+Classification priority:
+1. Choose 'restricted_zone' if a worker is entering or crossing a restricted boundary.
+2. Otherwise choose 'osha_hazard' if any non-PPE workplace hazard is visible, such as an unprotected edge or unsafe forklift/pedestrian proximity.
+3. Choose 'ppe_compliance' only when no restricted-zone or other OSHA hazard is visible. Treat helmet/vest observations as secondary when the primary incident is restricted-zone or OSHA.
+
+After classification, return the observations required for that category:
+- ppe_compliance: exactly 'helmet' and 'high_visibility_vest', with statuses present/missing/uncertain/not_observed.
+- restricted_zone: exactly 'zone_boundary_crossing' and 'authorization_indicators'.
+- osha_hazard: at least one hazard observation, using detected/not_detected/uncertain/not_observed.
+
+Restricted-zone status rules:
+- 'zone_boundary_crossing' uses detected/not_detected/uncertain/not_observed.
+- 'authorization_indicators' uses present/missing/uncertain/not_observed.
+- A warning sign or restricted-area label describes the boundary; it does NOT prove that the worker is authorized.
+- Use 'present' only for a visible worker badge, access credential, escort, or other direct authorization evidence.
+- Use 'missing' when the worker is visible but no direct authorization evidence is visible.
+
+PPE status rules:
+- Use 'missing' when the head or torso is clearly visible and the PPE item is absent.
+- Use 'not_observed' only when that body region is not visible in any sampled frame.
+
+If no incident is clearly supported, choose the closest category, use uncertain or not_observed,
+and set 'alert_assessment' to 'inconclusive'. Do not infer facts that are not visible.
+
+JSON Output Schema:
+{{
+  "summary": "Short factual description of the visible event.",
+  "visible_activity": "What workers visibly do.",
+  "incident_type": "ppe_compliance | restricted_zone | osha_hazard",
+  "alert_assessment": "supported | contradicted | inconclusive",
+  "safety_observations": [
+    {{
+      "item": "Category-specific observation item",
+      "visible_status": "Category-specific status",
+      "evidence": "Detailed visible evidence.",
+      "evidence_timestamps_sec": [2.0, 4.0]
+    }}
+  ],
+  "recommended_follow_up": "Actionable follow-up recommendation.",
+  "human_review_required": false
+}}
+"""
+    elif incident_type == IncidentType.PPE_COMPLIANCE:
+        prompt = common_header + f"""
+TASK: Evaluate Personal Protective Equipment (PPE) compliance for each worker visible.
+Evaluate 'helmet' and 'high_visibility_vest' INDEPENDENTLY for each worker.
+
+Allowed values:
+- 'alert_assessment': 'supported', 'contradicted', 'inconclusive'
+- 'visible_status': 'present', 'missing', 'uncertain', 'not_observed'
+  - 'missing': body region is clearly visible but the PPE item is NOT worn.
+  - 'present': PPE item is clearly worn.
 
 JSON Output Schema:
 {{
   "summary": "Short factual description of visible event.",
   "visible_activity": "What the worker visibly does.",
+  "incident_type": "ppe_compliance",
   "alert_assessment": "supported | contradicted | inconclusive",
-  "ppe_observations": [
+  "safety_observations": [
     {{
       "item": "helmet",
       "visible_status": "present | missing | uncertain | not_observed",
@@ -582,6 +788,87 @@ JSON Output Schema:
   "human_review_required": false
 }}
 """
+
+    elif incident_type == IncidentType.RESTRICTED_ZONE:
+        prompt = common_header + f"""
+TASK: Assess whether a worker has entered or is at the boundary of a restricted or unauthorized zone.
+Look for: marked floor lines or tape, warning signs ("Restricted Area", "Authorized Personnel Only",
+"No Entry", etc.), red/yellow safety barriers, locked gates, or visual boundary markers.
+
+Allowed values:
+- 'alert_assessment': 'supported' (worker clearly inside or crossing boundary),
+  'contradicted' (worker clearly outside), 'inconclusive' (ambiguous position)
+- 'visible_status': 'detected', 'not_detected', 'uncertain', 'not_observed'
+  - 'detected': boundary crossing or zone entry is clearly visible.
+  - 'not_detected': worker is visibly outside the restricted boundary.
+
+Provide two observations:
+1. 'zone_boundary_crossing': whether the worker has crossed or is crossing the restricted zone boundary.
+2. 'authorization_indicators': any visible PPE, badges, signage or access control features that indicate authorization status.
+
+JSON Output Schema:
+{{
+  "summary": "Short factual description of the visible event.",
+  "visible_activity": "What the worker visibly does near the restricted zone.",
+  "incident_type": "restricted_zone",
+  "alert_assessment": "supported | contradicted | inconclusive",
+  "safety_observations": [
+    {{
+      "item": "zone_boundary_crossing",
+      "visible_status": "detected | not_detected | uncertain | not_observed",
+      "evidence": "Describe the boundary markers visible and the worker's position relative to them.",
+      "evidence_timestamps_sec": [2.0, 4.0]
+    }},
+    {{
+      "item": "authorization_indicators",
+      "visible_status": "present | missing | uncertain | not_observed",
+      "evidence": "Describe any visible authorization indicators (PPE, badges, escort, signage).",
+      "evidence_timestamps_sec": [2.0, 4.0]
+    }}
+  ],
+  "recommended_follow_up": "Actionable follow-up recommendation.",
+  "human_review_required": false
+}}
+"""
+
+    elif incident_type == IncidentType.OSHA_HAZARD:
+        prompt = common_header + f"""
+TASK: Identify visible OSHA-related safety hazards. Assess each visible hazard independently.
+
+Common hazard types to look for (use the most appropriate item name):
+- 'fall_protection_hazard': worker at height or near unprotected edge without visible harness, guardrail, or fall arrest system.
+- 'forklift_pedestrian_proximity': forklift or powered industrial truck operating in close proximity to pedestrians without adequate separation.
+If other OSHA hazards are visible, include them with a descriptive item name (e.g. 'unsecured_load', 'blocked_emergency_exit').
+
+Allowed values:
+- 'alert_assessment': 'supported', 'contradicted', 'inconclusive'
+- 'visible_status': 'detected', 'not_detected', 'uncertain', 'not_observed'
+  - 'detected': hazard is clearly visible in the frames.
+  - 'not_detected': hazard type was looked for but not observed.
+
+IMPORTANT: Report PPE compliance (helmet, vest) only as secondary observations if clearly relevant to the hazard scene.
+
+JSON Output Schema:
+{{
+  "summary": "Short factual description of the visible safety hazard.",
+  "visible_activity": "What workers and equipment are visibly doing.",
+  "incident_type": "osha_hazard",
+  "alert_assessment": "supported | contradicted | inconclusive",
+  "safety_observations": [
+    {{
+      "item": "fall_protection_hazard | forklift_pedestrian_proximity | <other_hazard>",
+      "visible_status": "detected | not_detected | uncertain | not_observed",
+      "evidence": "Describe exactly what makes this a hazard, with visible details.",
+      "evidence_timestamps_sec": [2.0, 5.0]
+    }}
+  ],
+  "recommended_follow_up": "Actionable follow-up recommendation referencing OSHA standards where applicable.",
+  "human_review_required": false
+}}
+"""
+    else:
+        raise ValueError(f"Unknown incident type: {incident_type}")
+
     return prompt.strip()
 
 
@@ -612,9 +899,10 @@ class OllamaClient:
         self,
         frames: List[SampledFrame],
         duration_sec: float,
+        incident_type: Optional[IncidentType] = IncidentType.PPE_COMPLIANCE,
         alert_type: Optional[str] = None,
         alert_offset_sec: Optional[float] = None,
-    ) -> PPESummary:
+    ) -> SafetySummary:
         """
         Send frames and prompt to Ollama and return validated PPESummary.
         Never logs base64 images!
@@ -628,6 +916,7 @@ class OllamaClient:
         prompt = build_ollama_prompt(
             duration_sec=duration_sec,
             sampled_timestamps=timestamps,
+            incident_type=incident_type,
             alert_type=alert_type,
             alert_offset_sec=alert_offset_sec,
         )
@@ -682,7 +971,11 @@ class OllamaClient:
             raise ValueError("Empty response received from Ollama.")
 
         # Validate structured JSON output
-        summary = validate_summary_json(message_content, video_duration=duration_sec)
+        summary = validate_summary_json(
+            message_content,
+            video_duration=duration_sec,
+            incident_type=incident_type,
+        )
         return summary
 
 
@@ -693,6 +986,7 @@ class OllamaClient:
 def summarize_event(
     video_path: Path,
     event_id: Optional[str] = None,
+    incident_type: Optional[IncidentType] = None,
     alert_type: Optional[str] = None,
     camera_id: Optional[str] = None,
     alert_offset_sec: Optional[float] = None,
@@ -704,7 +998,7 @@ def summarize_event(
     max_frames: int = MAX_FRAMES_LIMIT,
     timeout: int = 300,
     client: Optional[OllamaClient] = None,
-) -> Tuple[bool, Optional[PPESummary]]:
+) -> Tuple[bool, Optional[SafetySummary]]:
     """
     Execute full pipeline for a single event:
     1. Validate video exists & load metadata.
@@ -737,7 +1031,10 @@ def summarize_event(
         logger.info("Event %s already completed in database.", event_id)
         if existing_record.get("summary_json"):
             try:
-                summary = validate_summary_json(existing_record["summary_json"])
+                summary = validate_summary_json(
+                    existing_record["summary_json"],
+                    incident_type=incident_type,
+                )
                 return False, summary
             except Exception:
                 pass
@@ -774,6 +1071,7 @@ def summarize_event(
         summary = ollama_client.generate_summary(
             frames=frames,
             duration_sec=meta.duration_seconds,
+            incident_type=incident_type,
             alert_type=alert_type,
             alert_offset_sec=alert_offset_sec,
         )
@@ -796,25 +1094,26 @@ def summarize_event(
         raise
 
 
-def print_summary(event_id: str, summary: PPESummary) -> None:
+def print_summary(event_id: str, summary: SafetySummary) -> None:
     """Print formatted summary with evidence timestamps for review."""
-    print("\n" + "=" * 65)
-    print(f" PPE EVENT SUMMARY: {event_id}")
-    print("=" * 65)
+    incident_label = summary.incident_type.upper().replace("_", " ")
+    print("\n" + "=" * 70)
+    print(f" SAFETY EVENT SUMMARY [{incident_label}]: {event_id}")
+    print("=" * 70)
     print(f" Summary:          {summary.summary}")
     print(f" Visible Activity: {summary.visible_activity}")
     print(f" Alert Assessment: {summary.alert_assessment.value.upper()}")
-    print("-" * 65)
-    print(" PPE OBSERVATIONS:")
-    for obs in summary.ppe_observations:
+    print("-" * 70)
+    print(" SAFETY OBSERVATIONS:")
+    for obs in summary.safety_observations:
         ts_str = ", ".join(f"{t:.2f}s" for t in obs.evidence_timestamps_sec)
-        print(f"  • {obs.item:20s}: [{obs.visible_status.value.upper()}]")
+        print(f"  • {obs.item:28s}: [{obs.visible_status.value.upper()}]")
         print(f"    Evidence:   {obs.evidence}")
         print(f"    Timestamps: [{ts_str}]")
-    print("-" * 65)
+    print("-" * 70)
     print(f" Recommended Follow-up: {summary.recommended_follow_up}")
     print(f" Human Review Required: {'YES' if summary.human_review_required else 'NO'}")
-    print("=" * 65 + "\n")
+    print("=" * 70 + "\n")
 
 
 # =====================================================================
@@ -844,10 +1143,20 @@ def main() -> int:
         help="Custom event ID (defaults to video file stem).",
     )
     parser.add_argument(
+        "--incident-type",
+        type=str,
+        default="auto",
+        choices=["auto", *[t.value for t in IncidentType]],
+        help=(
+            "Incident category: 'auto' asks the model to classify the clip; or use "
+            "'ppe_compliance', 'restricted_zone', or 'osha_hazard'."
+        ),
+    )
+    parser.add_argument(
         "--alert-type",
         type=str,
         default=None,
-        help="Upstream detector alert type (e.g., 'no_helmet', 'no_helmet_no_vest').",
+        help="Upstream detector alert type (e.g., 'no_helmet', 'restricted_zone_entry', 'fall_protection').",
     )
     parser.add_argument(
         "--camera-id",
@@ -931,19 +1240,24 @@ def main() -> int:
 
     for video_file in videos_to_process:
         eid = args.event_id if len(videos_to_process) == 1 and args.event_id else video_file.stem
-        # Derive alert_type if not explicitly set for test videos
+        requested_incident_type = (
+            None if args.incident_type == "auto" else IncidentType(args.incident_type)
+        )
+        # Alert metadata is supplied by an upstream detector when available;
+        # it is never guessed from the video filename.
         derived_alert = args.alert_type
-        if derived_alert is None:
-            if "helmet_and_vest_missing" in video_file.stem:
-                derived_alert = "no_helmet_no_vest"
-            elif "helmet_missing" in video_file.stem:
-                derived_alert = "no_helmet"
 
-        print(f"\nProcessing: {video_file.name} (Event ID: {eid})")
+        logger.info(
+            "Event %s → incident_type=%s, alert_type=%s",
+            eid, requested_incident_type.value if requested_incident_type else "auto", derived_alert,
+        )
+        display_type = requested_incident_type.value if requested_incident_type else "auto"
+        print(f"\nProcessing: {video_file.name} (Event ID: {eid}, Type: {display_type})")
         try:
             processed_new, summary = summarize_event(
                 video_path=video_file,
                 event_id=eid,
+                incident_type=requested_incident_type,
                 alert_type=derived_alert,
                 camera_id=args.camera_id,
                 alert_offset_sec=args.alert_offset,

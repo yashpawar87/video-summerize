@@ -1,10 +1,10 @@
-# Local PPE Video Summarization
+# Local Safety Video Summarization
 
-A local Python application that analyzes and summarizes short personal protective equipment (PPE) incident videos using a local Vision-Language Model (VLM) running on Ollama, OpenCV for frame extraction, and SQLite for persistence.
+A local Python application that analyzes and summarizes short PPE, restricted-zone, and OSHA hazard videos using a local Vision-Language Model (VLM) running on Ollama, OpenCV for frame extraction, and SQLite for persistence.
 
 ## Goal
 
-Provide structured, fact-grounded summaries of short CCTV-style PPE incident clips. The VLM describes visible facts and evidence without replacing upstream PPE detectors or fabricating unsupported safety conclusions.
+Provide structured, fact-grounded summaries of short CCTV-style safety clips. The VLM describes visible facts and evidence without replacing upstream detectors or fabricating unsupported safety conclusions.
 
 ## Hard Constraints & Architecture
 
@@ -42,8 +42,11 @@ Provide structured, fact-grounded summaries of short CCTV-style PPE incident cli
 │   ├── test_ollama_client.py
 │   └── test_evaluation.py
 └── ppe_test_dataset/           # Smoke test dataset
-    ├── helmet_and_vest_missing.mp4
-    ├── helmet_missing.mp4
+    ├── helmet_and_vest_missing.mp4       # local test media, ignored by Git
+    ├── helmet_missing.mp4                 # local test media, ignored by Git
+    ├── restricted_zone_entry.mp4          # local test media, ignored by Git
+    ├── fall_protection_hazard.mp4        # local test media, ignored by Git
+    ├── forklift_pedestrian_hazard.mp4    # local test media, ignored by Git
     └── manifest.json
 ```
 
@@ -76,10 +79,17 @@ pip install -r requirements.txt
 ### Process a Single Video
 
 ```bash
-python ppe_event_summarizer.py --video ppe_test_dataset/helmet_missing.mp4 \
-  --alert-type no_helmet \
-  --camera-id cam-01 \
-  --alert-offset 4.0
+python ppe_event_summarizer.py \
+  --video ppe_test_dataset/helmet_missing.mp4 \
+  --camera-id cam-01
+```
+
+By default, the model classifies the incident from the video frames. If an upstream detector already knows the category, you can force the analysis prompt:
+
+```bash
+python ppe_event_summarizer.py \
+  --video ppe_test_dataset/fall_protection_hazard.mp4 \
+  --incident-type osha_hazard
 ```
 
 ### Process the Entire Test Dataset
@@ -103,7 +113,8 @@ python ppe_event_summarizer.py --video ppe_test_dataset/helmet_missing.mp4 --for
 | `--video` | - | Path to a single video file |
 | `--dataset-dir` | - | Directory containing `.mp4` video files |
 | `--event-id` | File stem | Custom unique event identifier |
-| `--alert-type` | Auto-derived | Upstream detector alert type |
+| `--incident-type` | `auto` | Model-classified, or explicitly set to `ppe_compliance`, `restricted_zone`, or `osha_hazard` |
+| `--alert-type` | `None` | Optional alert type supplied by an upstream detector |
 | `--camera-id` | `cam-01` | Camera identifier |
 | `--alert-offset` | `None` | Clip-relative alert offset in seconds |
 | `--detector-meta` | `None` | JSON string of upstream detector metadata |
@@ -117,14 +128,21 @@ python ppe_event_summarizer.py --video ppe_test_dataset/helmet_missing.mp4 --for
 
 ## Summary Schema
 
-Each event produces a validated JSON object conforming to:
+Each event produces a validated JSON object conforming to the selected incident type. The common fields are `summary`, `visible_activity`, `incident_type`, `alert_assessment`, `safety_observations`, `recommended_follow_up`, and `human_review_required`.
+
+By default, the model classifies each clip from its frames; classification does not depend on the video filename. Restricted-zone events include `zone_boundary_crossing` and `authorization_indicators`. OSHA events include one or more hazards such as `fall_protection_hazard` or `forklift_pedestrian_proximity`.
+
+Use `--incident-type` only when an upstream system already knows the category or when you want to force a specific analysis prompt.
+
+Example PPE output:
 
 ```json
 {
   "summary": "Short factual description of visible event.",
   "visible_activity": "What the worker visibly does.",
+  "incident_type": "ppe_compliance",
   "alert_assessment": "supported",
-  "ppe_observations": [
+  "safety_observations": [
     {
       "item": "helmet",
       "visible_status": "missing",
@@ -145,8 +163,9 @@ Each event produces a validated JSON object conforming to:
 
 Allowed values:
 - `alert_assessment`: `supported`, `contradicted`, `inconclusive`
-- `visible_status`: `present`, `missing`, `uncertain`, `not_observed`
-- Items: Always includes both `helmet` and `high_visibility_vest`.
+- PPE `visible_status`: `present`, `missing`, `uncertain`, `not_observed`
+- Restricted-zone boundary status: `detected`, `not_detected`, `uncertain`, `not_observed`
+- OSHA hazard status: `detected`, `not_detected`, `uncertain`, `not_observed`
 
 ---
 
@@ -162,6 +181,7 @@ python evaluate.py --manifest ppe_test_dataset/manifest.json --db-path data/ppe_
 - When `reviewed` is `null`, reports `[⏳ PENDING REVIEW]`.
 - Treats `uncertain` as a distinct outcome rather than a match or error.
 - Summarizes counts across items and clips.
+- The supplied manifest includes reviewed restricted-zone and OSHA clips. Run the dataset command first to generate their summaries, then run the evaluator to compare all five clips.
 
 ---
 

@@ -7,6 +7,7 @@ from ppe_event_summarizer import (
     validate_summary_json,
     PPESummary,
     AlertAssessment,
+    IncidentType,
     VisibleStatus,
 )
 
@@ -37,9 +38,9 @@ def test_valid_summary_validation():
     summary = validate_summary_json(VALID_SUMMARY_DICT, video_duration=10.0)
     assert isinstance(summary, PPESummary)
     assert summary.alert_assessment == AlertAssessment.SUPPORTED
-    assert len(summary.ppe_observations) == 2
-    assert summary.ppe_observations[0].visible_status == VisibleStatus.MISSING
-    assert summary.ppe_observations[1].visible_status == VisibleStatus.PRESENT
+    assert len(summary.safety_observations) == 2
+    assert summary.safety_observations[0].visible_status == VisibleStatus.MISSING
+    assert summary.safety_observations[1].visible_status == VisibleStatus.PRESENT
     assert not summary.human_review_required
 
 
@@ -156,6 +157,107 @@ def test_item_name_normalization():
         ],
     }
     summary = validate_summary_json(dict_with_variants, video_duration=10.0)
-    items = [obs.item for obs in summary.ppe_observations]
+    items = [obs.item for obs in summary.safety_observations]
     assert "helmet" in items
     assert "high_visibility_vest" in items
+
+
+def _base_safety_summary(incident_type, observations):
+    return {
+        "summary": "Visible safety event.",
+        "visible_activity": "Worker activity is visible.",
+        "incident_type": incident_type,
+        "alert_assessment": "supported",
+        "safety_observations": observations,
+        "recommended_follow_up": "Review the event.",
+        "human_review_required": False,
+    }
+
+
+def test_restricted_zone_summary_validation():
+    data = _base_safety_summary("restricted_zone", [
+        {
+            "item": "zone_boundary_crossing",
+            "visible_status": "detected",
+            "evidence": "Worker crosses the marked boundary.",
+            "evidence_timestamps_sec": [2.0],
+        },
+        {
+            "item": "authorization_indicators",
+            "visible_status": "missing",
+            "evidence": "No badge or escort is visible.",
+            "evidence_timestamps_sec": [2.0],
+        },
+    ])
+    summary = validate_summary_json(data, video_duration=5.0, incident_type=IncidentType.RESTRICTED_ZONE)
+    assert summary.incident_type == "restricted_zone"
+
+
+def test_osha_hazard_summary_validation():
+    data = _base_safety_summary("osha_hazard", [
+        {
+            "item": "fall_protection_hazard",
+            "visible_status": "detected",
+            "evidence": "An unprotected elevated edge is visible.",
+            "evidence_timestamps_sec": [2.0],
+        },
+    ])
+    summary = validate_summary_json(data, video_duration=5.0, incident_type=IncidentType.OSHA_HAZARD)
+    assert summary.safety_observations[0].visible_status == VisibleStatus.DETECTED
+
+
+def test_auto_validation_uses_model_incident_type():
+    data = _base_safety_summary("restricted_zone", [
+        {
+            "item": "zone_boundary_crossing",
+            "visible_status": "detected",
+            "evidence": "Worker crosses the marked boundary.",
+            "evidence_timestamps_sec": [2.0],
+        },
+        {
+            "item": "authorization_indicators",
+            "visible_status": "missing",
+            "evidence": "No authorization indicator is visible.",
+            "evidence_timestamps_sec": [2.0],
+        },
+    ])
+    summary = validate_summary_json(data, video_duration=5.0, incident_type=None)
+    assert summary.incident_type == "restricted_zone"
+
+
+def test_auto_validation_requires_valid_model_incident_type():
+    data = _base_safety_summary("unknown_category", [])
+    with pytest.raises(ValueError, match="Automatic incident classification"):
+        validate_summary_json(data, incident_type=None)
+
+
+def test_incident_type_must_match_requested_type():
+    data = _base_safety_summary("ppe_compliance", [
+        {
+            "item": "zone_boundary_crossing",
+            "visible_status": "detected",
+            "evidence": "Boundary crossing is visible.",
+            "evidence_timestamps_sec": [2.0],
+        },
+        {
+            "item": "authorization_indicators",
+            "visible_status": "missing",
+            "evidence": "No authorization indicator is visible.",
+            "evidence_timestamps_sec": [2.0],
+        },
+    ])
+    with pytest.raises(ValueError, match="does not match requested incident type"):
+        validate_summary_json(data, video_duration=5.0, incident_type=IncidentType.RESTRICTED_ZONE)
+
+
+def test_incident_specific_status_is_enforced():
+    data = _base_safety_summary("osha_hazard", [
+        {
+            "item": "forklift_pedestrian_proximity",
+            "visible_status": "present",
+            "evidence": "Forklift is near a pedestrian.",
+            "evidence_timestamps_sec": [2.0],
+        },
+    ])
+    with pytest.raises(ValueError, match="must use one of"):
+        validate_summary_json(data, video_duration=5.0, incident_type=IncidentType.OSHA_HAZARD)
